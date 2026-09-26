@@ -1,9 +1,10 @@
-"""SQLite database setup and durable Agent Relay models.
+"""Database setup and durable Agent Relay models (SQLite starter + PostgreSQL).
 
-This module is intentionally the only place that knows about SQLite connection
-pragmas and its writer-lock transaction.  The rest of the application talks to
-the models through :mod:`storage`; replacing this module with a PostgreSQL
-engine and a row-locking claim transaction is the planned student exercise.
+SQLite is the local default (single file, WAL, ``BEGIN IMMEDIATE`` writer
+lock). When ``RELAY_DATABASE_URL`` points at PostgreSQL, the same models run
+on Postgres and writer serialization uses row locking
+(``FOR UPDATE SKIP LOCKED`` in :mod:`storage`) instead of ``BEGIN IMMEDIATE``.
+The rest of the app talks to models only through :mod:`storage`.
 """
 
 from __future__ import annotations
@@ -18,8 +19,19 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 
+def _normalize_url(url: str) -> str:
+    # Accept bare postgres:// URLs (e.g. from compose examples) and map them
+    # to the SQLAlchemy psycopg dialect we install.
+    if url.startswith("postgres://"):
+        return "postgresql+psycopg://" + url[len("postgres://"):]
+    if url.startswith("postgresql://"):
+        return "postgresql+psycopg://" + url[len("postgresql://"):]
+    return url
+
+
 def _database_url() -> str:
-    return os.getenv("RELAY_DATABASE_URL") or os.getenv("DATABASE_URL") or "sqlite:///./agent-relay.db"
+    raw = os.getenv("RELAY_DATABASE_URL") or os.getenv("DATABASE_URL") or "sqlite:///./agent-relay.db"
+    return _normalize_url(raw)
 
 
 def positive_int(name: str, default: int) -> int:
@@ -134,6 +146,13 @@ def _is_sqlite(url: str) -> bool:
     return url.startswith("sqlite")
 
 
+def _is_postgres(url: str) -> bool:
+    return url.startswith("postgresql") or url.startswith("postgres")
+
+
+IS_POSTGRES = _is_postgres(DATABASE_URL)
+
+
 engine_kwargs: dict[str, Any] = {"future": True, "pool_pre_ping": True}
 if _is_sqlite(DATABASE_URL):
     engine_kwargs.update({"connect_args": {"check_same_thread": False, "timeout": 30}})
@@ -159,7 +178,21 @@ SessionLocal = sessionmaker(bind=engine, class_=Session, expire_on_commit=False,
 
 
 def init_db() -> None:
-    Base.metadata.create_all(engine)
+    # Postgres in compose may still be starting when the API boots.
+    # Retry briefly; SQLite creates instantly so this is a no-op there.
+    import time
+
+    from sqlalchemy.exc import OperationalError
+
+    for attempt in range(30):
+        try:
+            Base.metadata.create_all(engine)
+            return
+        except OperationalError:
+            if IS_POSTGRES and attempt < 29:
+                time.sleep(1)
+                continue
+            raise
 
 
 @contextmanager
@@ -177,14 +210,17 @@ def db_session() -> Generator[Session, None, None]:
 
 @contextmanager
 def immediate_transaction() -> Generator[Session, None, None]:
-    """Run one SQLite writer transaction before selecting or changing work.
+    """Run one atomic writer transaction for claims/recovery/terminal writes.
 
-    SQLite does not support PostgreSQL's ``FOR UPDATE SKIP LOCKED``.  A
-    ``BEGIN IMMEDIATE`` writer reservation serializes claims (and recovery or
-    terminal submissions) across API processes, giving each task one active
-    lease.  This is the intentionally isolated seam for a future PostgreSQL
-    implementation.
+    SQLite: ``BEGIN IMMEDIATE`` serializes writers (no ``FOR UPDATE``).
+    PostgreSQL: normal transaction; concurrent claims are serialized by
+    ``SELECT ... FOR UPDATE SKIP LOCKED`` in :mod:`storage`.
     """
+
+    if not _is_sqlite(DATABASE_URL):
+        with db_session() as db:
+            yield db
+        return
 
     connection = engine.connect()
     session = Session(bind=connection, expire_on_commit=False, autoflush=True)
@@ -244,6 +280,7 @@ __all__ = [
     "Attempt",
     "Base",
     "DATABASE_URL",
+    "IS_POSTGRES",
     "DEFAULT_PAGE_SIZE",
     "LEASE_SECONDS",
     "MAX_ATTEMPTS",

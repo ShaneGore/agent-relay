@@ -21,6 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from database import (
+    IS_POSTGRES,
     Agent,
     Attempt,
     LEASE_SECONDS,
@@ -144,12 +145,17 @@ def claim_one(agent_id: str, worker_id: str | None) -> dict[str, Any] | None:
     with immediate_transaction() as db:
         now = utcnow()
         recover_expired_in_session(db, now)
-        task = db.scalar(
+        query = (
             select(Task)
             .where(Task.recipient_id == agent_id, Task.status == "queued")
             .order_by(Task.created_at, Task.id)
             .limit(1)
         )
+        # Postgres: skip rows locked by concurrent claimants.
+        # SQLite: BEGIN IMMEDIATE already serializes writers.
+        if IS_POSTGRES:
+            query = query.with_for_update(skip_locked=True)
+        task = db.scalar(query)
         if task is None:
             return None
         if task.attempt_count >= MAX_ATTEMPTS:
