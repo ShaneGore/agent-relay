@@ -1,0 +1,120 @@
+name: ci
+
+on: [push]
+
+jobs:
+  test-build-deploy:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: relay
+          POSTGRES_USER: relay
+          POSTGRES_PASSWORD: relay
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U relay -d relay"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      RELAY_DATABASE_URL: postgresql+psycopg://relay:relay@localhost:5432/relay
+      RELAY_BASE_URL: http://127.0.0.1:8000
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install "fastapi>=0.141.1" "psycopg[binary]>=3.3.5" "pydantic-settings>=2.15.0" "sqlalchemy>=2.0.52" "uvicorn[standard]>=0.52.4" "httpx>=0.28.1" "pytest>=9.1.1"
+
+      - name: Pick reachable Postgres host (localhost vs service name)
+        run: |
+          for host in localhost postgres; do
+            if python -c "import socket;socket.create_connection(('$host',5432),timeout=3)" 2>/dev/null; then
+              echo "Postgres reachable at $host"
+              echo "PGHOST_PICKED=$host" >> "$GITHUB_ENV"
+              break
+            fi
+          done
+          echo "PGHOST_PICKED=${PGHOST_PICKED:-localhost}"
+
+      - name: Starter tests against PostgreSQL
+        run: |
+          export RELAY_DATABASE_URL="postgresql+psycopg://relay:relay@${PGHOST_PICKED:-localhost}:5432/relay"
+          echo "RELAY_DATABASE_URL=$RELAY_DATABASE_URL"
+          pytest test_agent_relay.py -q
+
+      - name: Start API against PostgreSQL
+        run: |
+          export RELAY_DATABASE_URL="postgresql+psycopg://relay:relay@${PGHOST_PICKED:-localhost}:5432/relay"
+          echo "Starting API with $RELAY_DATABASE_URL"
+          nohup python -m uvicorn main:app --host 127.0.0.1 --port 8000 > /tmp/uvicorn.log 2>&1 &
+          for i in $(seq 1 30); do
+            if python -c "import urllib.request,json;print(json.loads(urllib.request.urlopen('http://127.0.0.1:8000/ready',timeout=5).read().decode()))" 2>/dev/null | grep -q ready; then
+              echo "API ready"; break
+            fi
+            sleep 2
+          done
+          python -c "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:8000/ready',timeout=10).read().decode())"
+
+      - name: Integration test against PostgreSQL API
+        run: pytest test_scenario1_live.py -q
+
+      - name: Build image with unique tag
+        run: |
+          # Unique per version: commit SHA + timestamp (reruns without a new
+          # commit still roll a new ReplicaSet).
+          STAMP="$(date +%Y%m%d%H%M%S)"
+          TAG="ci-${GITHUB_SHA:-local}-${STAMP}"
+          TAG="${TAG:0:32}"
+          echo "IMAGE_TAG=$TAG" >> "$GITHUB_ENV"
+          echo "Building agent-relay:$TAG"
+          docker build -t "agent-relay:$TAG" .
+          docker tag "agent-relay:$TAG" agent-relay:local
+
+      # Deploy runs only if every test step above passed (default GitHub behaviour:
+      # a failed step stops the job). If tests fail, the old kind Deployment is untouched.
+      - name: Deploy to kind
+        run: |
+          set -e
+          # Install kind + kubectl when missing (GitHub runner / act container).
+          command -v kind >/dev/null || { curl -Lo ./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-amd64 && chmod +x ./kind && sudo mv ./kind /usr/local/bin/kind || mv ./kind /tmp/kind; export PATH="$PATH:/tmp"; }
+          command -v kubectl >/dev/null || { curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" && chmod +x kubectl && sudo mv kubectl /usr/local/bin/kubectl || mv kubectl /tmp/kubectl; export PATH="$PATH:/tmp"; }
+          export PATH="$PATH:/tmp:/usr/local/bin"
+          CLUSTER="${KIND_CLUSTER:-agent-relay}"
+          # Reuse the existing kind cluster (local act shares the host Docker
+          # daemon, so `kind get clusters` sees it). Only create when absent.
+          if kind get clusters 2>/dev/null | grep -qx "$CLUSTER"; then
+            echo "Reusing kind cluster $CLUSTER"
+          elif kubectl cluster-info 2>/dev/null | grep -q "Kubernetes control plane"; then
+            echo "Using current kubectl context"
+          else
+            kind create cluster --name "$CLUSTER" --wait 120s
+          fi
+          # Wire kubeconfig. Inside act there is no host kubeconfig, so export
+          # one from kind. The cluster API is exposed on 0.0.0.0:6443
+          # (see kind-config.yaml), so act containers reach it via
+          # host.docker.internal. Skip TLS verify for the local cluster.
+          if [ "${ACT:-false}" = "true" ] && ! kubectl cluster-info 2>/dev/null | grep -q "Kubernetes control plane"; then
+            mkdir -p ~/.kube
+            kind get kubeconfig --name "$CLUSTER" > ~/.kube/config
+            kubectl config set-cluster "kind-$CLUSTER" --server=https://host.docker.internal:6443 --insecure-skip-tls-verify=true
+            kubectl config use-context "kind-$CLUSTER"
+          fi
+          kubectl cluster-info
+          kind load docker-image "agent-relay:${IMAGE_TAG}" --name "$CLUSTER"
+          docker tag "agent-relay:${IMAGE_TAG}" agent-relay:local
+          kind load docker-image agent-relay:local --name "$CLUSTER"
+          kubectl apply -f k8s/postgres.yaml
+          kubectl apply -f k8s/api.yaml
+          # Roll the Deployment to the unique tag and wait.
+          kubectl set image deployment/agent-relay "api=agent-relay:${IMAGE_TAG}" --record=false || kubectl patch deployment agent-relay --type=strategic -p "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"api\",\"image\":\"agent-relay:${IMAGE_TAG}\"}]}}}}"
+          kubectl rollout status deployment/agent-relay --timeout=180s
+          kubectl get pods
